@@ -1,7 +1,7 @@
 ## Interface: 120100
 ## Title: AutoMPlusFinder
 ## Notes: Mythic+ group finder filter and one-click application helper.
-## Author: OpenAI
+## Author: kssgit
 ## Version: 1.0.0
 ## SavedVariables: AutoMPlusFinderDB
 
