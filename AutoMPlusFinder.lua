@@ -1,11 +1,13 @@
-local ADDON_NAME = ...
+local ADDON_NAME, ns = ...
 local AMPF = CreateFrame("Frame")
+local watch = ns.NewWatchScheduler(GetTime)
 
 local DUNGEON_CATEGORY_ID = 2
 local CURRENT_SEASON_FILTER = (Enum and Enum.LFGListFilter and Enum.LFGListFilter.CurrentSeason) or 64
 local MAX_RENDERED_RESULTS = 50
 
 local defaults = {
+    searchInterval = 30,
     minLevel = 10,
     maxLevel = 12,
     roles = {
@@ -34,6 +36,7 @@ local state = {
 }
 
 local UI = {}
+local UpdateWatchStatus
 
 local function Print(msg)
     DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99AutoMPlusFinder|r: " .. tostring(msg))
@@ -372,14 +375,18 @@ local function RoleSummary(memberCounts)
 end
 
 local function NotifyNewMatches(matches)
+    if not watch.enabled or not state.ownedResults then return end
     local newCount = 0
-    local current = {}
+    local now = GetTime()
+    for id, seenAt in pairs(state.lastNotified) do
+        if now - seenAt > 1800 then state.lastNotified[id] = nil end
+    end
 
     for _, match in ipairs(matches) do
-        current[match.resultID] = true
         if not state.lastNotified[match.resultID] then
             newCount = newCount + 1
         end
+        state.lastNotified[match.resultID] = now
     end
 
     if newCount > 0 then
@@ -392,7 +399,6 @@ local function NotifyNewMatches(matches)
         end
     end
 
-    state.lastNotified = current
 end
 
 local function ApplyToMatch(match)
@@ -486,7 +492,7 @@ local function RenderResults()
     end
 end
 
-local function RefreshResults()
+local function RefreshResults(notify)
     if not AutoMPlusFinderDB or not C_LFGList.GetSearchResults then
         return
     end
@@ -520,11 +526,11 @@ local function RefreshResults()
     end)
 
     state.matches = matches
-    NotifyNewMatches(matches)
+    if notify then NotifyNewMatches(matches) end
     RenderResults()
 end
 
-local function DoSearch()
+local function ValidateSearch()
     if not SaveSettingsFromUI() then
         return
     end
@@ -539,17 +545,82 @@ local function DoSearch()
         Print("던전을 최소 1개 선택해야 합니다.")
         return
     end
+    return true
+end
 
-    if InCombatLockdown and InCombatLockdown() then
-        Print("전투 중에는 파티 검색을 실행하지 않습니다.")
-        return
+local function PauseReason()
+    if InCombatLockdown() then return "전투 중 일시정지" end
+    if UnitIsDeadOrGhost("player") then return "사망 중 일시정지" end
+    if IsInGroup() then return "파티 참가 중 일시정지" end
+    if C_LFGList.HasActiveEntryInfo and C_LFGList.HasActiveEntryInfo() then
+        return "내 파티 모집 중 일시정지"
     end
+    if PVEFrame and PVEFrame:IsShown() then return "파티 찾기 창 사용 중 일시정지" end
+    if GetCurrentKeyBoardFocus and GetCurrentKeyBoardFocus() then
+        return "문자 입력 중 일시정지"
+    end
+end
 
-    wipe(state.lastNotified)
-    UI.status:SetText("파티 찾기 검색 중...")
+UpdateWatchStatus = function()
+    if not UI.watchStatus then return end
+    UI.watchButton:SetText(watch.enabled and "감시 중지" or "감시 시작")
+    if not watch.enabled then
+        UI.watchStatus:SetText("감시 꺼짐 — 조건 설정 후 감시 시작")
+    elseif PauseReason() then
+        UI.watchStatus:SetText(PauseReason())
+    elseif watch.pending then
+        UI.watchStatus:SetText("파티 검색 응답 대기 중...")
+    elseif GetTime() < watch.nextAt then
+        local prefix = watch.failures > 0 and "검색 실패/지연 · 재시도까지 " or "다음 검색까지 "
+        UI.watchStatus:SetText(prefix .. math.ceil(watch.nextAt - GetTime()) .. "초")
+    else
+        UI.watchStatus:SetText("다음 이동 키 또는 월드 클릭에 검색 · 창을 닫아도 감시 유지")
+    end
+end
 
-    -- C_LFGList.Search 역시 hardware-event 제한 함수이므로 자동 타이머에서 호출하지 않는다.
-    C_LFGList.Search(DUNGEON_CATEGORY_ID, CURRENT_SEASON_FILTER, 0, nil, true)
+local function StopWatch()
+    watch:Stop()
+    state.ownedResults = false
+    UpdateWatchStatus()
+end
+
+local function SetSearchInterval(value)
+    AutoMPlusFinderDB.searchInterval = watch:SetInterval(value)
+    if UI.interval then UI.interval:SetText(tostring(watch.interval)) end
+    UpdateWatchStatus()
+end
+
+local function SearchFromInput()
+    if PauseReason() or not watch:Ready() then return end
+    if not ValidateSearch() then StopWatch(); return end
+    if not watch:Begin() then return end
+    state.ownedResults = false
+    state.issuingSearch = true
+    -- Only called synchronously from a real key/mouse/button handler.
+    local ok = pcall(function()
+        if state.clearSearchText and C_LFGList.ClearSearchTextFields then
+            C_LFGList.ClearSearchTextFields()
+            state.clearSearchText = false
+        end
+        C_LFGList.Search(DUNGEON_CATEGORY_ID, CURRENT_SEASON_FILTER, 0, nil, true)
+    end)
+    state.issuingSearch = false
+    if not ok then watch:Fail() end
+    UpdateWatchStatus()
+end
+
+local function StartWatch()
+    if not ValidateSearch() then return end
+    watch:Start()
+    state.ownedResults = false
+    state.clearSearchText = true
+    Print(string.format("감시 시작: 창을 닫고 퀘스트/채집을 계속하세요. %d초 간격, 전투 중에는 쉽니다.", watch.interval))
+    UpdateWatchStatus()
+end
+
+local function DoSearch()
+    if not watch.enabled then StartWatch() end
+    SearchFromInput()
 end
 
 local function CreateLabeledEditBox(parent, labelText, x, y, width)
@@ -622,7 +693,7 @@ end
 local function CreateUI()
     local frame = CreateFrame("Frame", "AutoMPlusFinderFrame", UIParent, "BackdropTemplate")
     UI.frame = frame
-    frame:SetSize(570, 650)
+    frame:SetSize(570, 720)
     frame:SetPoint(
         AutoMPlusFinderDB.point or "CENTER",
         UIParent,
@@ -655,7 +726,7 @@ local function CreateUI()
 
     local subtitle = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     subtitle:SetPoint("TOP", title, "BOTTOM", 0, -5)
-    subtitle:SetText("조건에 맞는 쐐기 파티를 필터링하고 클릭 한 번으로 신청")
+    subtitle:SetText("퀘스트·채집 중 파티 감시 · 일치 파티 발견 시 알림")
 
     local close = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
     close:SetPoint("TOPRIGHT", -5, -5)
@@ -720,21 +791,46 @@ local function CreateUI()
     UI.dungeonHint:SetJustifyH("LEFT")
 
     local searchButton = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    searchButton:SetSize(180, 34)
-    searchButton:SetPoint("TOP", dungeonBox, "BOTTOM", 0, -12)
-    searchButton:SetText("검색 / 갱신")
-    searchButton:SetScript("OnClick", DoSearch)
+    searchButton:SetSize(150, 34)
+    searchButton:SetPoint("TOP", dungeonBox, "BOTTOM", -85, -12)
+    UI.watchButton = searchButton
+    searchButton:SetText("감시 시작")
+    searchButton:SetScript("OnClick", function()
+        if watch.enabled then StopWatch() else DoSearch() end
+    end)
+
+    local refreshButton = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    refreshButton:SetSize(150, 34)
+    refreshButton:SetPoint("LEFT", searchButton, "RIGHT", 12, 0)
+    refreshButton:SetText("검색 / 갱신")
+    refreshButton:SetScript("OnClick", DoSearch)
 
     local restriction = frame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-    restriction:SetPoint("TOP", searchButton, "BOTTOM", 0, -5)
-    restriction:SetText("※ WoW API 제한으로 검색/신청은 사용자 클릭이 필요합니다.")
+    restriction:SetPoint("TOP", dungeonBox, "BOTTOM", 0, -52)
+    restriction:SetText("이동 키/월드 클릭으로 갱신 · 전투 중 대기 · 신청은 직접 클릭")
+
+    UI.interval = CreateLabeledEditBox(frame, "검색 간격(초, 10~300)", 22, -333, 50)
+    UI.interval:SetMaxLetters(3)
+    UI.interval:SetText(tostring(watch.interval))
+    UI.interval:SetScript("OnEnterPressed", function(self)
+        SetSearchInterval(self:GetText())
+        self:ClearFocus()
+    end)
+    UI.interval:SetScript("OnEditFocusLost", function(self)
+        SetSearchInterval(self:GetText())
+    end)
+
+    UI.watchStatus = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    UI.watchStatus:SetPoint("TOPLEFT", 22, -365)
+    UI.watchStatus:SetWidth(520)
+    UI.watchStatus:SetJustifyH("LEFT")
 
     UI.status = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    UI.status:SetPoint("TOPLEFT", 22, -325)
+    UI.status:SetPoint("TOPLEFT", 22, -390)
     UI.status:SetText("검색 결과 없음")
 
     local resultsBox = CreateFrame("Frame", nil, frame, "BackdropTemplate")
-    resultsBox:SetPoint("TOPLEFT", 20, -350)
+    resultsBox:SetPoint("TOPLEFT", 20, -415)
     resultsBox:SetPoint("BOTTOMRIGHT", -20, 22)
     resultsBox:SetBackdrop({
         bgFile = "Interface\\Buttons\\WHITE8x8",
@@ -755,6 +851,45 @@ local function CreateUI()
 
     frame:Hide()
     RebuildDungeonButtons()
+    UpdateWatchStatus()
+end
+
+local function InstallWatchInput()
+    -- A separate, mouse-transparent frame stays visible when the window closes.
+    local input = CreateFrame("Frame", nil, UIParent)
+    input:SetSize(1, 1)
+    input:SetPoint("TOPLEFT")
+    input:EnableKeyboard(true)
+    input:SetPropagateKeyboardInput(true)
+    input:SetScript("OnKeyDown", function()
+        -- Never change key propagation in combat, and never consume movement keys.
+        SearchFromInput()
+    end)
+    input:RegisterEvent("GLOBAL_MOUSE_DOWN")
+    input:SetScript("OnEvent", function()
+        local foci = GetMouseFoci and GetMouseFoci()
+        if foci and foci[1] == WorldFrame then SearchFromInput() end
+    end)
+    local elapsed = 0
+    input:SetScript("OnUpdate", function(_, delta)
+        elapsed = elapsed + delta
+        if elapsed < 0.25 then return end
+        elapsed = 0
+        watch:Tick()
+        UpdateWatchStatus()
+        -- No search API calls from OnUpdate or a timer.
+    end)
+    state.inputFrame = input
+    hooksecurefunc(C_LFGList, "Search", function()
+        if state.issuingSearch then return end
+        -- Another addon/default UI owns these results. Do not alert on them.
+        if watch.pending then watch:Fail() end
+        state.ownedResults = false
+        if watch.enabled then
+            StopWatch()
+            Print("다른 파티 검색을 감지해 감시를 중지했습니다. 다시 감시 시작을 누르세요.")
+        end
+    end)
 end
 
 local function ToggleUI()
@@ -773,6 +908,7 @@ AMPF:RegisterEvent("ADDON_LOADED")
 AMPF:RegisterEvent("PLAYER_LOGIN")
 AMPF:RegisterEvent("LFG_LIST_AVAILABILITY_UPDATE")
 AMPF:RegisterEvent("LFG_LIST_SEARCH_RESULTS_RECEIVED")
+AMPF:RegisterEvent("LFG_LIST_SEARCH_FAILED")
 AMPF:RegisterEvent("LFG_LIST_SEARCH_RESULT_UPDATED")
 AMPF:RegisterEvent("LFG_LIST_APPLICATION_STATUS_UPDATED")
 
@@ -782,12 +918,14 @@ AMPF:SetScript("OnEvent", function(self, event, ...)
         if loadedAddon ~= ADDON_NAME then return end
 
         AutoMPlusFinderDB = CopyDefaults(defaults, AutoMPlusFinderDB or {})
+        AutoMPlusFinderDB.searchInterval = watch:SetInterval(AutoMPlusFinderDB.searchInterval)
         C_LFGList.RequestAvailableActivities()
 
     elseif event == "PLAYER_LOGIN" then
         SetDefaultRoleFromSpec()
         DiscoverCurrentSeasonDungeons()
         CreateUI()
+        InstallWatchInput()
         Print("로드됨. /ampf 로 창을 열 수 있습니다.")
 
     elseif event == "LFG_LIST_AVAILABILITY_UPDATE" then
@@ -796,10 +934,19 @@ AMPF:SetScript("OnEvent", function(self, event, ...)
         end
 
     elseif event == "LFG_LIST_SEARCH_RESULTS_RECEIVED" then
-        RefreshResults()
+        if watch:Success() then
+            state.ownedResults = watch.enabled
+            RefreshResults(true)
+        end
+        UpdateWatchStatus()
+
+    elseif event == "LFG_LIST_SEARCH_FAILED" then
+        watch:Fail()
+        state.ownedResults = false
+        UpdateWatchStatus()
 
     elseif event == "LFG_LIST_SEARCH_RESULT_UPDATED" then
-        RefreshResults()
+        RefreshResults(true)
 
     elseif event == "LFG_LIST_APPLICATION_STATUS_UPDATED" then
         RefreshResults()
@@ -810,7 +957,20 @@ SLASH_AUTOMPLUSFINDER1 = "/ampf"
 SlashCmdList.AUTOMPLUSFINDER = function(msg)
     msg = (msg or ""):lower():match("^%s*(.-)%s*$")
 
-    if msg == "show" then
+    if msg:match("^interval%s*") then
+        local value = msg:match("^interval%s+(%d+)$")
+        if not value then Print("사용법: /ampf interval 30 (10~300초)"); return end
+        SetSearchInterval(value)
+        Print(string.format("검색 간격: %d초. 진행 중인 대기/실패 지연은 유지됩니다.", watch.interval))
+        return
+    end
+
+    if msg == "watch" or msg == "on" then
+        StartWatch()
+    elseif msg == "stop" or msg == "off" then
+        StopWatch()
+        Print("감시를 중지했습니다.")
+    elseif msg == "show" then
         UI.frame:Show()
         DiscoverCurrentSeasonDungeons()
         RebuildDungeonButtons()
@@ -818,6 +978,8 @@ SlashCmdList.AUTOMPLUSFINDER = function(msg)
     elseif msg == "hide" then
         UI.frame:Hide()
     elseif msg == "reset" then
+        StopWatch()
+        SetSearchInterval(defaults.searchInterval)
         AutoMPlusFinderDB.minLevel = defaults.minLevel
         AutoMPlusFinderDB.maxLevel = defaults.maxLevel
         AutoMPlusFinderDB.roles = CopyDefaults(defaults.roles, {})
@@ -840,6 +1002,9 @@ SlashCmdList.AUTOMPLUSFINDER = function(msg)
         Print("/ampf - 창 열기/닫기")
         Print("/ampf show - 창 열기")
         Print("/ampf hide - 창 닫기")
+        Print("/ampf watch - 감시 시작 (다음 실제 입력부터 검색)")
+        Print("/ampf stop - 감시 중지")
+        Print("/ampf interval 30 - 검색 간격 설정 (10~300초)")
         Print("/ampf reset - 설정 초기화")
     else
         ToggleUI()

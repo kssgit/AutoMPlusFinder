@@ -2,7 +2,8 @@
 ## Title: AutoMPlusFinder
 ## Notes: Mythic+ group finder filter and one-click application helper.
 ## Author: kssgit
-## Version: 1.0.0
+## Version: 1.1.1
 ## SavedVariables: AutoMPlusFinderDB
 
+WatchScheduler.lua
 AutoMPlusFinder.lua
